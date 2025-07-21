@@ -22,7 +22,10 @@
         "ms-azuretools.vscode-azurestaticwebapps",
         "ms-azuretools.vscode-azurefunctions",
         "ms-azuretools.vscode-azureresourcegroups",
-        "ms-vscode.azurecli"
+        "ms-vscode.azurecli",
+        "ms-python.python",
+        "ms-mssql.mssql",
+        "mtxr.sqltools"
       ]
     }
   }
