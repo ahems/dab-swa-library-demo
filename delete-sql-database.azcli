@@ -1,0 +1,2 @@
+az login --tenant ed9aa516-5358-4016-a8b2-b6ccb99142d0
+az sql server delete --name sql-kygtnt5bm5cds --resource-group rg-swa-library-demo --yes
