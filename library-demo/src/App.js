@@ -5,7 +5,7 @@ import { Navbar, Nav, Button } from 'react-bootstrap';
 import './App.css';
 
 import BookList from './Components/BookList/BookList';
-import AuthorList from './Components/AuthorList/AuthorList';
+// import AuthorList from './Components/AuthorList/AuthorList';
 
 const client = new ApolloClient({
   uri: '/data-api/graphql',

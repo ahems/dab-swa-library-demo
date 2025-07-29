@@ -11,15 +11,28 @@ param sqlAdminUsername string = uniqueString(newGuid())
 @secure()
 param sqlAdminPassword string = newGuid()
 
-// Monitor application with Azure Monitor
-module monitoring 'br/public:avm/ptn/azd/monitoring:0.1.0' = {
-  name: 'monitoring'
+// Monitor application with Azure Monitor - Log Analytics with daily quota cap
+module logAnalyticsWorkspace 'br/public:avm/res/operational-insights/workspace:0.12.0' = {
+  name: 'logAnalytics'
   params: {
-    logAnalyticsName: '${abbrs.operationalInsightsWorkspaces}${resourceToken}'
-    applicationInsightsName: '${abbrs.insightsComponents}${resourceToken}'
-    applicationInsightsDashboardName: '${abbrs.portalDashboards}${resourceToken}'
+    name: '${abbrs.operationalInsightsWorkspaces}${resourceToken}'
     location: location
     tags: tags
+    dailyQuotaGb: 1  // Set daily data cap to 1GB (minimum amount)
+    dataRetention: 0  // Minimum retention period for cost optimization
+    skuName: 'PerGB2018'  // Pay-as-you-go pricing tier
+  }
+}
+
+// Application Insights connected to the Log Analytics workspace
+module applicationInsights 'br/public:avm/res/insights/component:0.4.1' = {
+  name: 'applicationInsights'
+  params: {
+    name: '${abbrs.insightsComponents}${resourceToken}'
+    location: location
+    tags: tags
+    workspaceResourceId: logAnalyticsWorkspace.outputs.resourceId
+    applicationType: 'web'
   }
 }
 
@@ -77,6 +90,11 @@ module database 'br/public:avm/res/sql/server:0.15.0' = {
         roleDefinitionIdOrName: '056cd41c-7e88-42e1-933e-88ba6a50c9c3' // SQL DB Contributor
         principalType: 'ServicePrincipal'
       }
+      {
+        principalId: staticWebApp.identity.principalId
+        roleDefinitionIdOrName: '056cd41c-7e88-42e1-933e-88ba6a50c9c3' // SQL DB Contributor
+        principalType: 'ServicePrincipal'
+      }
     ]
   }
 }
@@ -116,29 +134,51 @@ module databaseInitScript 'br/public:avm/res/resources/deployment-script:0.5.1' 
       }
     ]
     scriptContent: '''
-      # Install SqlServer module with force and skip publisher check to avoid compatibility issues
-      Write-Output "Installing SqlServer module..."
-      Install-Module -Name SqlServer -Force -AllowClobber -SkipPublisherCheck -AcceptLicense -Scope CurrentUser
-      
-      # Import the module explicitly
-      Write-Output "Importing SqlServer module..."
-      Import-Module SqlServer -Force
-      
-      # Verify the module is loaded
-      if (Get-Command Invoke-Sqlcmd -ErrorAction SilentlyContinue) {
-          Write-Output "SqlServer module loaded successfully"
-      } else {
-          Write-Error "SqlServer module failed to load Invoke-Sqlcmd cmdlet"
-          throw "SqlServer module installation failed"
-      }
+      # Use .NET SqlClient instead of PowerShell SqlServer module to avoid package corruption issues
+      Write-Output "Loading System.Data.SqlClient..."
+      Add-Type -AssemblyName "System.Data.SqlClient"
       
       # Build connection string
       $connectionString = "Server=tcp:$($env:SQL_SERVER),1433;Initial Catalog=$($env:SQL_DATABASE);User ID=$($env:SQL_USERNAME);Password=$($env:SQL_PASSWORD);Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;"
       
+      # Function to execute SQL commands using .NET SqlClient
+      function Invoke-SqlQuery {
+          param(
+              [string]$ConnectionString,
+              [string]$Query
+          )
+          
+          $connection = New-Object System.Data.SqlClient.SqlConnection
+          $connection.ConnectionString = $ConnectionString
+          
+          try {
+              Write-Output "Executing query..."
+              $connection.Open()
+              $command = $connection.CreateCommand()
+              $command.CommandText = $Query
+              $command.CommandTimeout = 300  # 5 minutes timeout
+              $result = $command.ExecuteNonQuery()
+              Write-Output "Query executed successfully. Rows affected: $result"
+              return $result
+          }
+          catch {
+              Write-Error "SQL execution failed: $($_.Exception.Message)"
+              throw
+          }
+          finally {
+              if ($connection.State -eq 'Open') {
+                  $connection.Close()
+              }
+          }
+      }
+      
       Write-Output "Testing connection..."
       try {
-          Invoke-Sqlcmd -ConnectionString $connectionString -Query "SELECT 1 as TestConnection" -ErrorAction Stop
+          $testConnection = New-Object System.Data.SqlClient.SqlConnection
+          $testConnection.ConnectionString = $connectionString
+          $testConnection.Open()
           Write-Output "Database connection successful!"
+          $testConnection.Close()
       }
       catch {
           Write-Error "Connection test failed: $($_.Exception.Message)"
@@ -169,7 +209,7 @@ CREATE TABLE books(
 "@
 
       try {
-          Invoke-Sqlcmd -ConnectionString $connectionString -Query $createTablesQuery -ErrorAction Stop
+          Invoke-SqlQuery -ConnectionString $connectionString -Query $createTablesQuery
           Write-Output "Tables created successfully!"
       }
       catch {
@@ -189,7 +229,7 @@ SET IDENTITY_INSERT authors OFF;
 "@
 
       try {
-          Invoke-Sqlcmd -ConnectionString $connectionString -Query $insertAuthorsQuery -ErrorAction Stop
+          Invoke-SqlQuery -ConnectionString $connectionString -Query $insertAuthorsQuery
           Write-Output "Authors data inserted successfully!"
       }
       catch {
@@ -208,7 +248,7 @@ SET IDENTITY_INSERT books OFF;
 "@
 
       try {
-          Invoke-Sqlcmd -ConnectionString $connectionString -Query $insertBooksQuery -ErrorAction Stop
+          Invoke-SqlQuery -ConnectionString $connectionString -Query $insertBooksQuery
           Write-Output "Books data inserted successfully!"
           Write-Output "Database initialization completed!"
       }
@@ -221,22 +261,67 @@ SET IDENTITY_INSERT books OFF;
   }
 }
 
-// Static Web App using Azure Verified Module
-module staticWebApp 'br/public:avm/res/web/static-site:0.1.0' = {
-  name: 'staticWebApp'
-  params: {
-    name: '${abbrs.webStaticSites}libraryDemo-${resourceToken}'
-    location: location
-    tags: union(tags, {
-      'azd-service-name': 'library-demo'
-    })
-    sku: 'Standard'
+// Static Web App with Database Connection support (using direct resource for full feature access)
+resource staticWebApp 'Microsoft.Web/staticSites@2024-04-01' = {
+  name: '${abbrs.webStaticSites}libraryDemo-${resourceToken}'
+  location: location
+  tags: {
+    'azd-service-name': 'library-demo'
+  }
+  sku: {
+    name: 'Standard'
+    tier: 'Standard'
+  }
+  identity: {
+    type: 'SystemAssigned'
+  }
+  properties: {
+    provider: 'None'
     buildProperties: {
       skipGithubActionWorkflowGeneration: true
     }
-    provider: 'None'
-    appSettings: {
-      DATABASE_CONNECTION_STRING: 'Server=tcp:${database.outputs.fullyQualifiedDomainName},1433;Initial Catalog=${abbrs.sqlServersDatabases}Library-${resourceToken};Persist Security Info=False;User ID=${sqlAdminUsername};Password=${sqlAdminPassword};MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=60;'
-    }
+    enterpriseGradeCdnStatus: 'Disabled'
+    stagingEnvironmentPolicy: 'Enabled'
+    allowConfigFileUpdates: true
+    publicNetworkAccess: 'Enabled'
   }
 }
+
+// App Settings for Static Web App - includes environment variables
+resource staticWebAppSettings 'Microsoft.Web/staticSites/config@2024-04-01' = {
+  name: 'appsettings'
+  parent: staticWebApp
+  properties: {
+    AZURE_SQL_CONNECTION_STRING: 'Server=tcp:${database.outputs.fullyQualifiedDomainName},1433;Initial Catalog=${abbrs.sqlServersDatabases}Library-${resourceToken};User ID=${sqlAdminUsername};Password=${sqlAdminPassword};Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;'
+  }
+}
+
+// Database Connection for Static Web App
+resource staticWebAppDatabaseConnection 'Microsoft.Web/staticSites/databaseConnections@2024-11-01' = {
+  name: 'default'
+  parent: staticWebApp
+  properties: {
+    resourceId: database.outputs.resourceId
+    connectionString: 'Server=tcp:${database.outputs.fullyQualifiedDomainName},1433;Initial Catalog=${abbrs.sqlServersDatabases}Library-${resourceToken};User ID=${sqlAdminUsername};Password=${sqlAdminPassword};Encrypt=True;TrustServerCertificate=False;Connection Timeout=30;'
+    region: location
+  }
+}
+
+// Outputs for GitHub Actions and deployment
+@description('The name of the Static Web App resource')
+output STATIC_WEB_APP_NAME string = staticWebApp.name
+
+@description('The default URL of the Static Web App')
+output STATIC_WEB_APP_URL string = 'https://${staticWebApp.properties.defaultHostname}'
+
+@description('The resource ID of the Static Web App')
+output STATIC_WEB_APP_RESOURCE_ID string = staticWebApp.id
+
+@description('The name of the database connection')
+output DATABASE_CONNECTION_NAME string = staticWebAppDatabaseConnection.name
+
+@description('The resource group name containing the Static Web App')
+output RESOURCE_GROUP_NAME string = resourceGroup().name
+
+@description('Instructions for getting the deployment token')
+output DEPLOYMENT_TOKEN_INSTRUCTIONS string = 'Run: az staticwebapp secrets list --name ${staticWebApp.name} --resource-group ${resourceGroup().name} --query "properties.apiKey" --output tsv'

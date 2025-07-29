@@ -1,0 +1,12 @@
+{
+  "$schema": "https://aka.ms/azure/static-web-apps-cli/schema",
+  "configurations": {
+    "library-demo": {
+      "appLocation": ".",
+      "outputLocation": "build",
+      "dataApiLocation": "public/swa-db-connections",
+      "appBuildCommand": "npm run build",
+      "run": "npm start"
+    }
+  }
+}

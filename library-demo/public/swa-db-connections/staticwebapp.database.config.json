@@ -5,14 +5,14 @@
       "options": {
         "set-session-context": false
       },
-      "connection-string": "@env('DATABASE_CONNECTION_STRING')"
+      "connection-string": "@env('AZURE_SQL_CONNECTION_STRING')"
     },
     "runtime": {
       "rest": {
-        "path": "/api"
+        "path": "/data-api"
       },
       "graphql": {
-        "path": "/graphql"
+        "path": "/data-api/graphql"
       },
       "host": {
         "mode": "production",
